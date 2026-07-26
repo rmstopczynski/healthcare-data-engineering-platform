@@ -1,24 +1,31 @@
 # This file does NOT go in your git repo — dbt looks for it at
 # ~/.dbt/profiles.yml (a fixed location outside any project folder),
-# specifically so connection details/credentials never get committed.
+# specifically so the access token below never gets committed.
 #
 # Setup:
 #   mkdir -p ~/.dbt
 #   cp profiles.yml.sample ~/.dbt/profiles.yml
+#   # then fill in host / http_path / token below
 #
-# (The dev-only healthcare/healthcare credentials below are fine to
-# keep as-is since they're local Docker Postgres creds, not anything
-# real — but keeping this file out of git is still the right habit.)
+# Where to find each value (all in the Databricks workspace UI):
+#   host      -> workspace URL, without "https://" (e.g. dbc-xxxxxxxx-xxxx.cloud.databricks.com)
+#   http_path -> SQL Warehouses -> your warehouse -> Connection details -> HTTP Path
+#   token     -> Settings -> Developer -> Access tokens -> Generate new token
+#                (scope it to "jobs" + "sql" only — least privilege)
+#
+# The same file (mounted read-only) is used both on your host machine
+# and inside the Airflow container — Databricks is a cloud endpoint,
+# so there's no "container vs host hostname" split like there was with
+# local Postgres.
 
 healthcare_dbt:
   target: dev
   outputs:
     dev:
-      type: postgres
-      host: 127.0.0.1
-      port: 5432
-      user: healthcare
-      password: healthcare
-      dbname: healthcare_db
-      schema: public
+      type: databricks
+      host: "{{ env_var('DATABRICKS_HOST') }}"
+      http_path: "{{ env_var('DATABRICKS_HTTP_PATH') }}"
+      token: "{{ env_var('DATABRICKS_TOKEN') }}"
+      catalog: workspace
+      schema: silver   # overridden per-model by generate_schema_name.sql (silver/gold)
       threads: 4

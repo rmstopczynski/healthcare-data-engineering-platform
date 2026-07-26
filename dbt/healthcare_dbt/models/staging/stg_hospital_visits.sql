@@ -1,4 +1,4 @@
-select distinct on (visit_id)
+select
     visit_id,
     admission_date,
     discharge_date,
@@ -10,5 +10,5 @@ select distinct on (visit_id)
     trim(admission_type) as admission_type,
     procedure_id,
     trim(diagnosis) as diagnosis
-from {{ source('raw', 'hospital_visits') }}
-order by visit_id
+from {{ source('bronze', 'hospital_visits') }}
+qualify row_number() over (partition by visit_id order by visit_id) = 1

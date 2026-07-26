@@ -1,44 +1,47 @@
 """
-Consumes events from the "patient-events" Kafka topic and writes them
-into streaming.patient_events. This is the "Kafka Topic -> Warehouse"
-leg of the roadmap's Step 7 diagram.
+Consumes ADT events from the "adt-events" Kafka topic and writes them
+out as a batched newline-delimited JSON file, instead of inserting
+directly into a warehouse.
 
-Deliberately a plain Kafka consumer rather than Spark Structured
-Streaming -- see the main README / KAFKA_README.md for why. The core
-mechanics (consumer group, offset tracking, at-least-once delivery) are
-the same regardless of which client reads the topic.
+Why a file instead of a direct DB write (this is the one real design
+change from the previous version of this script): Databricks Free
+Edition is serverless-only, with outbound network access restricted to
+a limited set of trusted domains -- it cannot open a connection back
+to a Kafka broker (or any warehouse) running in local Docker. Landing
+cleaned events as files and letting Databricks Auto Loader pick them up
+sidesteps that constraint entirely, and mirrors a common real-world
+pattern (Kafka -> object storage sink -> lakehouse ingestion) rather
+than a lakehouse engine consuming the topic natively.
+
+Still a plain Kafka consumer, not Spark Structured Streaming -- see
+KAFKA_README.md for why. The core mechanics (consumer group, offset
+tracking, at-least-once delivery) are unchanged regardless of what
+happens to the message after it's read.
 
 Bounded, not infinite: stops after CONSUMER_TIMEOUT_MS of no new
-messages, so this behaves like every other one-shot script in this
-project (docker exec, runs, exits) rather than a daemon you have to
-kill manually.
+messages, same one-shot behavior as the rest of this project's scripts.
 
 Run via: docker exec healthcare_airflow python3 /opt/airflow/data/kafka_consumer.py
 (or scripts/run_kafka_consumer.sh, which wraps that)
+
+Output: newline-delimited JSON batch files under ./adt_landing/, ready
+to be uploaded to the Databricks volume landing folder (see
+scripts/upload_adt_batch_to_databricks.sh) for Auto Loader to ingest.
 """
 
 import json
 import os
+from datetime import datetime, timezone
+from pathlib import Path
 
-import psycopg2
 from kafka import KafkaConsumer
 
 BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-TOPIC = os.environ.get("KAFKA_TOPIC", "patient-events")
-GROUP_ID = os.environ.get("KAFKA_GROUP_ID", "patient-events-consumer")
+TOPIC = os.environ.get("KAFKA_TOPIC", "adt-events")
+GROUP_ID = os.environ.get("KAFKA_GROUP_ID", "adt-events-consumer")
 CONSUMER_TIMEOUT_MS = int(os.environ.get("CONSUMER_TIMEOUT_MS", "10000"))
 
-PG_HOST = os.environ.get("PGHOST", "postgres")
-PG_PORT = os.environ.get("PGPORT", "5432")
-PG_USER = os.environ.get("PGUSER", "healthcare")
-PG_PASSWORD = os.environ.get("PGPASSWORD", "healthcare")
-PG_DB = os.environ.get("PGDATABASE", "healthcare_db")
-
-INSERT_SQL = """
-    INSERT INTO streaming.patient_events (event_id, event_type, patient_id, event_time, payload)
-    VALUES (%s, %s, %s, %s, %s)
-    ON CONFLICT (event_id) DO NOTHING;
-"""
+OUT_DIR = Path(os.environ.get("ADT_LANDING_DIR", "adt_landing"))
 
 
 def main():
@@ -52,46 +55,38 @@ def main():
         consumer_timeout_ms=CONSUMER_TIMEOUT_MS,
     )
 
-    conn = psycopg2.connect(
-        host=PG_HOST, port=PG_PORT, user=PG_USER, password=PG_PASSWORD, dbname=PG_DB
-    )
-    cur = conn.cursor()
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    batch_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out_path = OUT_DIR / f"adt_batch_{batch_stamp}.jsonl"
 
     print(f"Consuming from '{TOPIC}' on {BOOTSTRAP_SERVERS} "
           f"(group={GROUP_ID}, stops after {CONSUMER_TIMEOUT_MS}ms idle)...")
 
-    counts = {"admission": 0, "lab_result": 0, "vital_sign": 0}
+    counts = {"admit": 0, "discharge": 0, "transfer": 0}
     total = 0
 
-    for message in consumer:
-        event = message.value
-        cur.execute(
-            INSERT_SQL,
-            (
-                event["event_id"],
-                event["event_type"],
-                event["patient_id"],
-                event["event_time"],
-                json.dumps(event),
-            ),
-        )
-        counts[event["event_type"]] = counts.get(event["event_type"], 0) + 1
-        total += 1
+    with open(out_path, "w") as f:
+        for message in consumer:
+            event = message.value
+            f.write(json.dumps(event) + "\n")
+            counts[event["event_type"]] = counts.get(event["event_type"], 0) + 1
+            total += 1
 
-        if total % 50 == 0:
-            conn.commit()
-            print(f"  ... {total} events written")
+            if total % 50 == 0:
+                print(f"  ... {total} events written")
 
-    conn.commit()
-    cur.close()
-    conn.close()
     consumer.close()
 
+    if total == 0:
+        out_path.unlink(missing_ok=True)
+        print("Done. No new events on the topic -- nothing written.")
+        return
+
     print(f"Done. Wrote {total} events "
-          f"({counts.get('admission', 0)} admissions, "
-          f"{counts.get('lab_result', 0)} lab results, "
-          f"{counts.get('vital_sign', 0)} vital signs) "
-          f"to streaming.patient_events.")
+          f"({counts.get('admit', 0)} admits, "
+          f"{counts.get('discharge', 0)} discharges, "
+          f"{counts.get('transfer', 0)} transfers) "
+          f"to {out_path}")
 
 
 if __name__ == "__main__":

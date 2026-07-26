@@ -1,16 +1,18 @@
 # dbt Transformation Layer
 
-This replaces `sql/02_staging_tables.sql` and `sql/03_analytics_tables.sql`
-with dbt models — same transforms (dedup, typing, joins, denormalization),
-but now with tests, auto-generated documentation, and a lineage graph.
+The transformation layer for this project: Bronze -> Silver (staging
+models: dedup, typing) -> Gold (mart models: joins, denormalization,
+star schema), targeting Databricks via `dbt-databricks`, with tests,
+auto-generated documentation, and a lineage graph.
 
 ## Setup
 
 ```bash
-pip install dbt-core dbt-postgres
+pip install dbt-core dbt-databricks
 
 mkdir -p ~/.dbt
 cp profiles.yml.sample ~/.dbt/profiles.yml
+# fill in host / http_path / token from your Databricks workspace
 ```
 
 `profiles.yml` is intentionally kept outside this folder (and out of git)
@@ -23,10 +25,10 @@ since it's where connection credentials live — dbt always looks for it at
 healthcare_dbt/
 ├── dbt_project.yml
 ├── macros/
-│   └── generate_schema_name.sql   -- keeps models in exact "staging"/"analytics" schemas
+│   └── generate_schema_name.sql   -- keeps models in exact "silver"/"gold" schemas
 └── models/
     ├── staging/
-    │   ├── _staging__sources.yml   -- declares raw.* as dbt sources
+    │   ├── _staging__sources.yml   -- declares bronze.* as dbt sources
     │   ├── _staging__models.yml    -- tests + docs for staging models
     │   └── stg_*.sql                -- one per raw table, same cleanup as sql/02
     └── marts/
@@ -42,8 +44,8 @@ healthcare_dbt/
 
 ## Running it
 
-This assumes `raw.*` already has data loaded (via
-`load_synthetic_data.sql`, as in the main pipeline setup).
+This assumes `bronze.*` already has data loaded (via
+`databricks/notebooks/01_bronze_ingest.py`, as in the main pipeline setup).
 
 ```bash
 cd healthcare_dbt
@@ -67,9 +69,10 @@ and is genuinely useful to screenshot for a portfolio README.
   against its dimension (e.g. every `fact_hospital_visit.doctor_id` must
   exist in `dim_doctor.doctor_id`). This is the automated version of the
   cascading-FK-failure bug documented in the main README's "Challenges"
-  section — with these tests in place, `dbt test` would have caught that
-  bug immediately with a clear failure message, instead of it surfacing
-  as a silent 0-row table three steps downstream.
+  section (from the original Postgres build) — with these tests in
+  place, `dbt test` would have caught that bug immediately with a clear
+  failure message, instead of it surfacing as a silent 0-row table three
+  steps downstream.
 - **`accepted_values`** — `sex` and `age_group` are checked against known
   valid values, catching bad data at the model level rather than letting
   it flow through to analytics queries.

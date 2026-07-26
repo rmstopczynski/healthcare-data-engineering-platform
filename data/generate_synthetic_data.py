@@ -1,7 +1,9 @@
 """
 Generates a small, internally-consistent synthetic healthcare dataset
-matching the RAW schema (raw.states, raw.cities, ... raw.hospital_visits).
-Output: CSVs in ./synthetic_data/, ready to load with psql's \\copy.
+matching the Bronze layer's source tables (states, cities, ...
+hospital_visits). Output: CSVs in ./synthetic_data/, ready to upload to
+a Databricks volume and load into bronze.* (see
+databricks/notebooks/01_bronze_ingest.py).
 """
 
 import csv

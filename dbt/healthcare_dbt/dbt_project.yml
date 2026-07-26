@@ -18,8 +18,8 @@ clean-targets:
 models:
   healthcare_dbt:
     staging:
-      +schema: staging
+      +schema: silver
       +materialized: view
     marts:
-      +schema: analytics
+      +schema: gold
       +materialized: table

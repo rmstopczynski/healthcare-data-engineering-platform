@@ -1,32 +1,16 @@
 services:
-  postgres:
-    image: postgres:16
-    container_name: healthcare_pg
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: healthcare
-      POSTGRES_PASSWORD: healthcare
-      POSTGRES_DB: healthcare_db
-    ports:
-      - "5432:5432"
-    volumes:
-      - healthcare_pg_data:/var/lib/postgresql/data
-
-  # Web UI for browsing tables/running queries, at http://localhost:8080
-  # (server: postgres, user/pass/db as above)
-  adminer:
-    image: adminer
-    container_name: healthcare_adminer
-    restart: unless-stopped
-    ports:
-      - "8080:8080"
-    depends_on:
-      - postgres
-
   # ---------------------------------------------------------------------
   # Airflow — orchestrates the pipeline as a scheduled, monitored DAG.
-  # "standalone" mode: single container, SQLite metadata DB.
+  # "standalone" mode: single container, SQLite metadata DB (this was
+  # already true before the v3 rework — Airflow's own metadata store
+  # was never the Postgres warehouse, so removing that warehouse
+  # doesn't change anything here).
   # Web UI at http://localhost:8083 once it's up.
+  #
+  # The warehouse itself is now Databricks (Free Edition, serverless) —
+  # a managed cloud workspace, not a local container. This DAG's tasks
+  # call the Databricks Jobs API rather than talking to a local Postgres
+  # service, so there's no local warehouse container to depend on here.
   # ---------------------------------------------------------------------
   airflow:
     build:
@@ -35,87 +19,38 @@ services:
     container_name: healthcare_airflow
     restart: unless-stopped
     depends_on:
-      - postgres
-      - minio
       - kafka
     environment:
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      # Set these in a local .env file (gitignored) or export them
+      # before `docker compose up` — never commit real values.
+      DATABRICKS_HOST: ${DATABRICKS_HOST:-}
+      DATABRICKS_HTTP_PATH: ${DATABRICKS_HTTP_PATH:-}
+      DATABRICKS_TOKEN: ${DATABRICKS_TOKEN:-}
     ports:
       - "8083:8080"
     volumes:
+      # ./dbt must contain a real profiles.yml (gitignored — copy from
+      # dbt/profiles.yml.sample) for dbt to find at /opt/airflow/dbt/profiles.yml
       - ./dags:/opt/airflow/dags
-      - ./sql:/opt/airflow/sql
       - ./dbt:/opt/airflow/dbt
       - ./data:/opt/airflow/data
-      - ./airflow_profiles:/opt/airflow/airflow_profiles
-      - ./load_synthetic_data.sql:/opt/airflow/load_synthetic_data.sql
+      - ./databricks:/opt/airflow/databricks
       - airflow_home:/opt/airflow
     command: standalone
-
-  # ---------------------------------------------------------------------
-  # MinIO — S3-compatible object store, standing in for AWS S3.
-  # Console UI at http://localhost:9001, S3 API at http://localhost:9000
-  # ---------------------------------------------------------------------
-  minio:
-    image: minio/minio
-    container_name: healthcare_minio
-    restart: unless-stopped
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    volumes:
-      - minio_data:/data
-    command: server /data --console-address ":9001"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  # One-shot: creates the "healthcare-raw-files" bucket, then exits.
-  minio-init:
-    image: minio/mc
-    container_name: healthcare_minio_init
-    depends_on:
-      minio:
-        condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 minioadmin minioadmin &&
-      mc mb -p local/healthcare-raw-files &&
-      echo 'Bucket ready.'
-      "
-
-  # ---------------------------------------------------------------------
-  # Spark — PySpark jobs reading from MinIO (s3a://) and writing
-  # partitioned Parquet + a summary table into Postgres via JDBC.
-  # Batch-job image, meant for `docker compose run --rm spark ...`
-  # (see scripts/run_spark_job.sh), not left running via `up`.
-  # Spark UI (while a job is running) at http://localhost:4040
-  # ---------------------------------------------------------------------
-  spark:
-    build:
-      context: .
-      dockerfile: Dockerfile.spark
-    container_name: healthcare_spark
-    restart: "no"
-    depends_on:
-      - postgres
-      - minio
-    volumes:
-      - ./spark_jobs:/opt/spark_jobs
-    ports:
-      - "4040:4040"
 
   # ---------------------------------------------------------------------
   # Kafka — single-node broker in KRaft mode (no ZooKeeper needed).
   # PLAINTEXT listener for container-to-container traffic (kafka:9092),
   # EXTERNAL listener for host-machine tools if you ever want to connect
   # directly (localhost:9094).
+  #
+  # This stays local/self-hosted deliberately: Databricks Free Edition
+  # is serverless-only with restricted outbound network access, so it
+  # cannot open a connection to a broker running here. The consumer
+  # below writes cleaned events to a landing folder instead; Databricks
+  # Auto Loader picks those up from there. See KAFKA_README.md.
   # ---------------------------------------------------------------------
   kafka:
     image: apache/kafka:latest
@@ -142,7 +77,7 @@ services:
       timeout: 10s
       retries: 5
 
-  # One-shot: creates the "patient-events" topic, then exits.
+  # One-shot: creates the "adt-events" topic, then exits.
   kafka-init:
     image: apache/kafka:latest
     container_name: healthcare_kafka_init
@@ -151,7 +86,7 @@ services:
         condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic patient-events --partitions 3 --replication-factor 1 &&
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic adt-events --partitions 3 --replication-factor 1 &&
       echo 'Topic ready.'
       "
 
@@ -169,6 +104,4 @@ services:
       - "8084:8080"
 
 volumes:
-  healthcare_pg_data:
   airflow_home:
-  minio_data:

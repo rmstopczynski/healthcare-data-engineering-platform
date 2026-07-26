@@ -1,35 +1,41 @@
 # Airflow Orchestration Layer
 
-Turns the manual command sequence (generate synthetic data → load into
-`raw` → `dbt run` → `dbt test` → validate) into a scheduled, monitored
-Airflow DAG.
+Turns the manual command sequence (generate synthetic data → upload to
+Databricks → trigger Bronze ingestion → `dbt run` → `dbt test`) into a
+scheduled, monitored Airflow DAG.
 
-## What gets added
+## What changed from the Postgres version of this repo
+
+Previously, Airflow's tasks ran `psql` against a local Postgres
+warehouse in the same docker-compose network. Now the warehouse is
+Databricks (Free Edition, a managed cloud workspace) — so tasks either
+run locally (`generate_synthetic_data`, `dbt run`/`dbt test` via
+`dbt-databricks`) or call the **Databricks Jobs API** over the network
+(`upload_csvs_to_databricks`, `trigger_databricks_bronze_job`). There's
+no local warehouse container to `depends_on` anymore.
 
 ```
-healthcare-pipeline/
-├── docker-compose.yml          <- replaces your existing one (adds an "airflow" service)
-├── Dockerfile.airflow          <- new: official Airflow image + psql + dbt
-├── dags/
-│   └── healthcare_pipeline_dag.py
-└── airflow_profiles/
-    └── profiles.yml            <- dbt profile used ONLY inside the Airflow container
+├── docker-compose.yml          <- "airflow" service only calls out to kafka now
+├── Dockerfile.airflow          <- dbt-databricks, databricks provider, databricks-cli
+└── dags/
+    └── healthcare_pipeline_dag.py
 ```
-
-`airflow_profiles/profiles.yml` is separate from `dbt/profiles.yml.sample`.
-Same database, different hostname: your host machine reaches Postgres at
-`127.0.0.1`, but the Airflow container reaches it at `postgres` (the
-docker-compose service name) — containers talk to each other over
-Docker's internal network, not through your machine's loopback address.
 
 ## Setup
 
-1. **Replace your `docker-compose.yml`** with the one in this bundle (or
-   manually merge the `airflow` service block into your existing file —
-   the new one is a strict superset, nothing was removed).
-2. **Copy `Dockerfile.airflow`** into your repo root, alongside
-   `docker-compose.yml`.
-3. **Copy `dags/` and `airflow_profiles/`** into your repo root.
+1. Create a Databricks Job from `databricks/notebooks/01_bronze_ingest.py`
+   (Workflows -> Create Job -> Notebook task), note its numeric Job ID.
+2. Set the required environment variables (a local `.env` file,
+   gitignored, or exported before `docker compose up`):
+   ```
+   DATABRICKS_HOST=https://your-workspace-url
+   DATABRICKS_TOKEN=your-token
+   DATABRICKS_HTTP_PATH=your-sql-warehouse-http-path
+   DATABRICKS_BRONZE_JOB_ID=123456789
+   ```
+3. Copy `dbt/profiles.yml.sample` to `dbt/profiles.yml` (gitignored —
+   this is the file mounted into the container at
+   `/opt/airflow/dbt/profiles.yml`).
 
 ## Running it
 
@@ -37,59 +43,54 @@ Docker's internal network, not through your machine's loopback address.
 docker compose up -d --build
 ```
 
-The `--build` matters here specifically — it's what triggers building the
-custom Airflow image (installing psql + dbt on top of the base image).
-First run will take several minutes; subsequent runs reuse the built
-image and start in seconds.
+`--build` matters — it triggers building the custom Airflow image
+(dbt-databricks + the Databricks provider + CLI on top of the base
+image). First run takes a few minutes; later runs reuse the built
+image.
 
-Watch the logs until it's ready:
 ```bash
 docker logs -f healthcare_airflow
 ```
-Look for a line containing `Airflow is ready` and a printed
-username/password (standalone mode auto-generates an admin login on
-first boot — it's usually `admin` / a random password printed directly
-in the logs, sometimes also saved to a `standalone_admin_password.txt`
-file inside the container).
+Look for `Airflow is ready` and the auto-generated admin
+username/password (standalone mode prints these on first boot).
 
 ## Using it
 
-1. Open **http://localhost:8083**
-2. Log in with the admin credentials from the logs
-3. Find `healthcare_pipeline` in the DAG list
-4. Click the toggle to un-pause it (if not already active)
-5. Click the ▶ (Trigger DAG) button to run it manually right now, or just
-   wait — it's scheduled `@daily`
+1. Open **http://localhost:8083**, log in with the logged admin credentials
+2. Find `healthcare_pipeline` in the DAG list, un-pause it if needed
+3. Trigger it manually (▶), or let it run on its `@daily` schedule
 
-Click into a run to see the graph view: five tasks in a line
-(`generate_synthetic_data → load_raw_data → dbt_run → dbt_test →
-validate_migration`), each one colored by status (green = success,
-red = failed, sitting on retry = orange). Click any task box → **Logs**
-to see exactly what it did — this is the same output you'd get running
-the command by hand, just captured and organized per-task.
+Graph view shows five tasks in a line:
+`generate_synthetic_data → upload_csvs_to_databricks →
+trigger_databricks_bronze_job → dbt_run → dbt_test`. Click any task box
+→ **Logs** to see exactly what it did.
 
-## Why this matters over just running the commands yourself
+## Why this matters over running the commands yourself
 
-- **Retries** — each task retries once automatically on failure (configured
-  in `default_args` in the DAG file) before it's marked failed
-- **Scheduling** — `@daily` means this can run unattended every day without
-  you remembering to kick it off
-- **Observability** — task-level logs, run history, and a visual graph of
-  what succeeded/failed and when, instead of scrolling back through
-  terminal history
-- **Dependency enforcement** — Airflow won't run `dbt_test` if `dbt_run`
-  failed; the manual command sequence has no such guardrail
+- **Retries** — each task retries once automatically on failure
+- **Scheduling** — `@daily` means this can run unattended
+- **Observability** — task-level logs, run history, a visual graph of what succeeded/failed
+- **Dependency enforcement** — Airflow won't run `dbt_test` if `dbt_run` failed
+
+## The one architectural boundary worth being ready to explain
+
+The ADT/Kafka streaming branch (`scripts/run_kafka_demo.sh` +
+`databricks/notebooks/02_adt_autoloader.py`) runs **independently of
+this DAG and its `@daily` schedule** — Airflow is fundamentally a batch
+scheduler, not a continuous-stream runner. In a real deployment, the
+Auto Loader notebook would run as its own always-on or frequently-
+triggered Databricks Job (e.g. every few minutes via `trigger(availableNow=True)`
+on a schedule), separate from the nightly batch DAG. Same boundary that
+existed in the original architecture doc — worth naming directly if
+asked "does Airflow orchestrate the streaming part too?"
 
 ## A note on "standalone" mode
 
-This uses Airflow's `standalone` command — a single container, SQLite
-metadata database, `SequentialExecutor`. That's a deliberate simplification
-for a local demo project: it's one command instead of the ~5 services
-(webserver, scheduler, worker, Redis, Postgres-for-Airflow-itself) that
-`CeleryExecutor` production setups require. It also means everything runs
-sequentially, one task at a time — fine here, since the DAG's tasks are
-already meant to run in strict order anyway. If you wanted to demonstrate
-parallel task execution for a portfolio piece, that would need
-`LocalExecutor` with a dedicated Postgres metadata database instead —
-worth mentioning as a known simplification if this comes up in an
-interview.
+This uses Airflow's `standalone` command — one container, SQLite
+metadata database, `SequentialExecutor`. Deliberate simplification for
+a local portfolio project instead of the ~5 services a `CeleryExecutor`
+production setup needs. Tasks run one at a time, which is fine here
+since the DAG's tasks are meant to run in strict order anyway —
+`LocalExecutor` with a dedicated metadata database would be the answer
+if parallel task execution needed demonstrating, worth naming as a
+known simplification if asked.
