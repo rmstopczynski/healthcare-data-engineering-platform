@@ -4,9 +4,9 @@
 set -euo pipefail
 
 echo "==> Running dbt models against Databricks..."
-docker exec healthcare_airflow bash -c "cd /opt/airflow/dbt/healthcare_dbt && dbt run --profiles-dir /opt/airflow/dbt"
+docker exec healthcare_airflow bash -c "cd /opt/airflow/dbt/healthcare_dbt && /home/airflow/tools-venv/bin/dbt run --profiles-dir /opt/airflow/dbt"
 
-echo "==> Running dbt tests..."
-docker exec healthcare_airflow bash -c "cd /opt/airflow/dbt/healthcare_dbt && dbt test --profiles-dir /opt/airflow/dbt"
+echo "==> Running /home/airflow/tools-venv/bin/dbt tests..."
+docker exec healthcare_airflow bash -c "cd /opt/airflow/dbt/healthcare_dbt && /home/airflow/tools-venv/bin/dbt test --profiles-dir /opt/airflow/dbt"
 
-echo "==> dbt run + test complete."
+echo "==> /home/airflow/tools-venv/bin/dbt run + test complete."
