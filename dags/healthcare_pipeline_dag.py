@@ -75,7 +75,7 @@ with DAG(
     trigger_databricks_bronze_job = BashOperator(
         task_id="trigger_databricks_bronze_job",
         bash_command=(
-            'curl -sf -X POST "$DATABRICKS_HOST/api/2.1/jobs/run-now" '
+            'curl -sf -X POST "https://$DATABRICKS_HOST/api/2.1/jobs/run-now" '
             '-H "Authorization: Bearer $DATABRICKS_TOKEN" '
             f'-d \'{{"job_id": {BRONZE_JOB_ID}}}\''
         ),
@@ -83,12 +83,12 @@ with DAG(
 
     dbt_run = BashOperator(
         task_id="dbt_run",
-        bash_command=f"cd {DBT_PROJECT_DIR} && dbt run --profiles-dir {DBT_PROFILES_DIR}",
+        bash_command=f"cd {DBT_PROJECT_DIR} && /home/airflow/tools-venv/bin/dbt run --profiles-dir {DBT_PROFILES_DIR}",
     )
 
     dbt_test = BashOperator(
         task_id="dbt_test",
-        bash_command=f"cd {DBT_PROJECT_DIR} && dbt test --profiles-dir {DBT_PROFILES_DIR}",
+        bash_command=f"cd {DBT_PROJECT_DIR} && /home/airflow/tools-venv/bin/dbt test --profiles-dir {DBT_PROFILES_DIR}",
     )
 
     generate_synthetic_data >> upload_csvs_to_databricks >> trigger_databricks_bronze_job >> dbt_run >> dbt_test
