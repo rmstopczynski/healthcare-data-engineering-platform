@@ -1,211 +1,216 @@
-# Healthcare Data Pipeline — Oracle to Cloud Warehouse Migration
+# Healthcare Data Engineering Pipeline — Databricks Lakehouse
 
-A healthcare data pipeline that migrates a normalized OLTP schema (originally
-designed against Oracle) into a **RAW → STAGING → ANALYTICS** layered
-warehouse, following the same architecture pattern used in production
-Snowflake environments — built and run on **Postgres + Docker** for a
-free, fully local development environment.
+A healthcare data pipeline built on a **medallion (Bronze → Silver →
+Gold) lakehouse architecture** on Databricks — synthetic patient,
+provider, and hospital-visit data cleaned and modeled through dbt, plus
+a near-real-time ADT (Admit/Discharge/Transfer) event stream landed via
+Kafka and ingested with Databricks Auto Loader.
 
 ```
-Source (Oracle-style, 3NF)
-        │
-        ▼
-   RAW schema           ← untouched, loosely typed, mirrors source 1:1
-        │
-        ▼
-   STAGING schema        ← typed, constrained, deduplicated, cleaned
-        │
-        ▼
-   ANALYTICS schema        ← star schema: fact tables + conformed dimensions
+Source (7 synthetic CSVs, 3NF)          ADT events (Kafka, local)
+        │                                        │
+        ▼                                        ▼
+   BRONZE (Delta)                    landing files (.jsonl)
+   raw copy + ingestion metadata      uploaded to a Databricks volume
+        │                                        │
+   PySpark cleaning                     Databricks Auto Loader
+        │                                        │
+        ▼                                        ▼
+   SILVER (dbt staging models)        SILVER STREAM (adt_events, Delta)
+   deduped, typed, conformed                     │
+        │                                        │
+        └───────────────────┬────────────────────┘
+                             ▼
+                  GOLD (dbt marts)
+                  fact_hospital_visit, fact_prescription,
+                  dim_patient/doctor/medication/procedure/date
+                  + bed-occupancy query against the ADT stream
 ```
-
-Full architecture (all 7 layers):
-
-![Architecture diagram](docs/architecture_diagram.svg)
 
 ## Contents
 
-- [Origin and rebuild scope](#origin-and-rebuild-scope)
-- [Architecture: batch and streaming, deliberately](#architecture-batch-and-streaming-deliberately)
-- [Why Postgres instead of Snowflake](#why-postgres-instead-of-snowflake)
+- [Why this version exists](#why-this-version-exists)
+- [Why Databricks over Postgres](#why-databricks-over-postgres)
+- [The constraint that shapes the streaming design](#the-constraint-that-shapes-the-streaming-design)
 - [Source schema](#source-schema)
 - [Quickstart](#quickstart)
 - [Data](#data)
-- [Validated results](#validated-results)
-- [Sample queries](#sample-queries)
 - [dbt transformation layer](#dbt-transformation-layer)
 - [Airflow orchestration](#airflow-orchestration)
-- [MinIO / S3-pattern ingestion](#minio--s3-pattern-ingestion)
-- [PySpark distributed processing](#pyspark-distributed-processing)
-- [Kafka streaming](#kafka-streaming)
+- [Kafka + Auto Loader streaming](#kafka--auto-loader-streaming)
+- [Sample queries](#sample-queries)
+- [What's still open](#whats-still-open)
 - [Challenges encountered](#challenges-encountered-and-how-they-were-resolved)
-- [Roadmap](#roadmap)
 - [Repo structure](#repo-structure)
 - [Resume & interview talking points](RESUME_TALKING_POINTS.md)
 
-## Origin and rebuild scope
+## Why this version exists
 
-The **schema design** — the star schema, the fact/dimension split, the
-Julian date dimension, the original ERD — came out of a group project for
-a university course (ISM 6208, Data Warehousing). That project's paper
-proposed a healthcare data warehouse using Oracle, synthetic data
-generated with Mockaroo, and OLAP/OLTP schema comparisons; there's no
-public repo for it, just the paper and diagrams.
+This repo went through three stages:
 
-Everything past the schema concept is original, solo work: the synthetic
-data generator here uses Faker, not Mockaroo, and produces its own
-dataset independent of the original project's data; the entire technical
-implementation (Postgres, Docker, dbt, Airflow, MinIO, PySpark, Kafka)
-didn't exist in the original project at all.
+1. **Origin.** The star schema — the fact/dimension split, the Julian
+   date dimension, the original ERD — came from a university course
+   project (ISM 6208, Data Warehousing) proposing a healthcare data
+   warehouse on Oracle/Snowflake. No public repo, just the paper and
+   diagrams.
+2. **v1 rebuild.** A real, runnable implementation on Postgres + Docker
+   + dbt + Airflow + MinIO (S3-pattern staging) + local PySpark + Kafka
+   — everything past the schema concept, original solo work.
+3. **v2/v3 rework (this version).** Migrated the warehouse/compute
+   layer to Databricks + Delta Lake specifically for resume/keyword
+   alignment with current job postings, and **pruned** MinIO and the
+   parallel Snowflake DDL folder in the process — they added defend-
+   surface (three different "storage layer" stories in one repo)
+   without adding a distinct lesson beyond what dbt + Delta already
+   demonstrate. The streaming story also changed from generic
+   vitals/lab-result events to ADT (Admit/Discharge/Transfer)
+   specifically, a real, HL7-adjacent healthcare pattern.
 
-Worth calling out directly: the original paper's own "Next Steps"
-section states *"Snowflake or another suitable option should be
-utilized as the data warehouse platform"* — recommending, but never
-implementing, a move to a real cloud warehouse. That's exactly where
-this project starts. The paper also flagged real limitations —
-no Slowly Changing Dimension (SCD2) handling, and a
-recommendation to "transition from batch ETL to streaming data
-pipelines" for real-time metrics. The Kafka layer in this repo is a
-direct answer to that second point, built independently, well past
-what the original coursework scoped.
+Worth calling out directly: this is a **rework, not a rebuild**. The
+dimensional schema, the dbt project (models, tests, docs), the Airflow
+DAG shape, and the Kafka producer/consumer mechanics all carried over —
+what changed was the warehouse target, the layer names
+(`raw/staging/analytics` → `bronze/silver/gold`), a handful of
+Postgres-only SQL functions ported to their Databricks equivalents, and
+the streaming ingestion path.
 
-## Architecture: batch and streaming, deliberately
+## Why Databricks over Postgres
 
-This isn't seven tools bolted together for their own sake — it models
-two real data patterns a hospital system actually has. Structured
-historical records (admissions, billing, insurance claims) arrive in
-batches: that's the `RAW → STAGING → ANALYTICS` pipeline, dbt, Airflow,
-and Spark. Continuous operational events (vitals, lab results) arrive as
-a stream: that's the Kafka layer. Both land in the same Postgres
-warehouse. This is a common hybrid pattern in production data
-platforms (sometimes called a Lambda architecture — a batch layer and a
-speed layer feeding one serving layer) — built here as one integrated
-system rather than two disconnected exercises, specifically because
-that's how it actually gets used in practice.
+Postgres was the lower-effort choice — it was already fully built and
+working. Databricks was chosen anyway, deliberately, because it's
+specifically named in job postings this project is meant to speak to,
+in a way "a Postgres warehouse" isn't. That tradeoff (interview
+readiness / lower risk vs. resume keyword alignment) is itself
+reasonable interview material if asked "why not just keep what already
+worked?"
 
-## Why Postgres instead of Snowflake
+## The constraint that shapes the streaming design
 
-This was originally designed as a Snowflake migration (see `snowflake/` for
-the original DDL, written to Snowflake's SQL dialect). Snowflake's only
-free option is a 30-day trial, which isn't a great fit for an ongoing
-portfolio project meant to be re-run and iterated on indefinitely. Postgres
-is a genuine client-server SQL database (unlike an embedded engine like
-DuckDB), has first-class support in every tool downstream of this project —
-dbt, Airflow, Spark's JDBC driver — and containerizes in one command. The
-warehouse-specific pieces that don't carry over cleanly (micro-partitions,
-`CLUSTER BY`, decoupled compute/storage billing) are called out explicitly
-in the code rather than glossed over.
+**Databricks Free Edition is serverless-only**: no classic clusters, no
+custom compute configurations, and outbound network access restricted
+to a limited set of trusted domains. Concretely, it cannot open a
+network connection to a Kafka broker running in local Docker — there's
+no path for a direct Kafka consumer (native or Spark Structured
+Streaming) to reach it, regardless of client library or JAR version.
+
+The design that works within that: the Kafka consumer lands cleaned ADT
+events as batch files; those get uploaded to a Databricks volume;
+**Auto Loader** (serverless-native, incremental file ingestion) picks
+them up from there into a Silver Delta table. This is also a
+legitimate, common real-world pattern — Kafka landing to object storage
+before lakehouse ingestion — not purely a free-tier workaround. See
+`databricks/README.md` and `KAFKA_README.md` for the full reasoning.
+
+This was verified directly against a live Free Edition workspace before
+committing to the design: Auto Loader ingesting a test file into Delta,
+and the workspace-level Jobs API (`/api/2.1/jobs/list`) reachable with
+a scoped personal access token — both confirmed working before Phase 1
+of the rework began.
 
 ## Source schema
 
 Two source ER diagrams drove this project: a normalized OLTP schema
-(patients, hospitals, doctors, prescriptions, hospital visits, insurance)
-and a target dimensional model (two fact tables — `PRESCRIPTION_FACT` and
-`HOSPITAL_VISIT_FACT` — surrounded by conformed dimensions, including a
-Julian date dimension). See `docs/erd/` for both diagrams.
+(patients, hospitals, doctors, prescriptions, hospital visits,
+insurance) and a target dimensional model (two fact tables —
+`fact_prescription` and `fact_hospital_visit` — surrounded by conformed
+dimensions, including a Julian date dimension). See `docs/erd/` for both
+diagrams (note: `docs/architecture_diagram.svg` predates this rework and
+needs regenerating to reflect the Databricks/ADT architecture above).
 
 ## Quickstart
 
 Requires [Docker Desktop](https://www.docker.com/products/docker-desktop/)
-— nothing else. `scripts/` runs every command (psql, python, dbt) *inside*
-the containers, so your host machine doesn't need psql, Python, dbt, or
-any Python packages installed at all.
+and a free [Databricks account](https://www.databricks.com/try-databricks)
+(**Free Edition**, not the 14-day trial).
 
+**1. One-time Databricks setup** — see `databricks/README.md` for the
+full walkthrough: create the landing volume, the three schemas
+(`bronze`/`silver`/`gold`), a personal access token, and a Job wrapping
+`databricks/notebooks/01_bronze_ingest.py`.
+
+**2. Local environment:**
 ```bash
-# 1. Start Postgres, Adminer, and Airflow (first run builds a custom
-#    Airflow image with psql + dbt baked in — takes a few minutes)
-docker compose up -d --build
-
-# 2. Run the whole pipeline: schema, synthetic data, transforms, validation
-./scripts/run_all.sh
+cp dbt/profiles.yml.sample dbt/profiles.yml   # fill in host/http_path/token
+docker compose up -d --build                  # first run builds the custom Airflow image
 ```
 
-That's it — two commands, nothing installed on your machine besides
-Docker. `scripts/run_all.sh` calls the individual scripts in order, each
-usable on its own too:
-
-| Script | What it does |
-|---|---|
-| `scripts/setup_db.sh` | Creates raw/staging/analytics schemas + tables |
-| `scripts/load_data.sh` | Generates synthetic data and loads it into `raw.*` |
-| `scripts/run_transforms.sh` | Runs the raw-SQL staging + analytics transforms |
-| `scripts/run_dbt.sh` | Alternative to the above: runs `dbt run` + `dbt test` instead |
-| `scripts/validate.sh` | Prints row counts across all three layers |
-
-Credentials (dev-only, safe to keep public): user `healthcare`, password
-`healthcare`, database `healthcare_db`.
-
-Airflow UI: `http://localhost:8083` (admin credentials auto-generated on
-first boot, printed in `docker logs healthcare_airflow`). Adminer (DB
-browser): `http://localhost:8080`.
-
-### Alternative: running commands directly on your host
-
-If you'd rather install `psql`/Python/dbt locally and run commands
-yourself instead of through the wrapper scripts (useful if you're
-actively developing and want faster iteration), the equivalent manual
-sequence is:
-
+**3. Run the batch pipeline:**
 ```bash
-psql -h 127.0.0.1 -p 5432 -U healthcare -d healthcare_db -f sql/00_setup_schemas.sql
-psql -h 127.0.0.1 -p 5432 -U healthcare -d healthcare_db -f sql/01_raw_tables.sql
-psql -h 127.0.0.1 -p 5432 -U healthcare -d healthcare_db -f sql/02_staging_tables.sql
-psql -h 127.0.0.1 -p 5432 -U healthcare -d healthcare_db -f sql/03_analytics_tables.sql
-
-python3 data/generate_synthetic_data.py
-psql -h 127.0.0.1 -p 5432 -U healthcare -d healthcare_db -f load_synthetic_data.sql
-
-psql -h 127.0.0.1 -p 5432 -U healthcare -d healthcare_db -f sql/02_staging_tables.sql
-psql -h 127.0.0.1 -p 5432 -U healthcare -d healthcare_db -f sql/03_analytics_tables.sql
-
-psql -h 127.0.0.1 -p 5432 -U healthcare -d healthcare_db -f sql/04_validate_migration.sql
+./scripts/generate_data.sh
+# upload the generated CSVs to the workspace volume (see databricks/README.md),
+# then run the Bronze notebook, then:
+./scripts/run_dbt.sh
 ```
+Or trigger the whole thing via the Airflow DAG at `http://localhost:8083`
+once `DATABRICKS_BRONZE_JOB_ID` is set — see `AIRFLOW_README.md`.
 
-### Optional: dbt transformation layer
-
-`sql/02_staging_tables.sql` + `sql/03_analytics_tables.sql` (raw SQL) and
-the dbt project in `dbt/` build the *same* staging/analytics tables two
-different ways — use `scripts/run_dbt.sh` for the containerized version,
-or manually:
-
+**4. Run the streaming demo:**
 ```bash
-pip install dbt-core dbt-postgres
-mkdir -p ~/.dbt && cp dbt/profiles.yml.sample ~/.dbt/profiles.yml
-cd dbt/healthcare_dbt
-dbt run             # builds all staging views + mart tables
-dbt test            # 60 tests: unique, not_null, relationships, accepted_values
-dbt docs generate && dbt docs serve --port 8081
+./scripts/run_kafka_demo.sh
 ```
+Then run `databricks/notebooks/02_adt_autoloader.py` in the workspace
+(or as its own Databricks Job) to ingest the landed batch.
 
 ## Data
 
-No production/real dataset was available for this project (the original
-Oracle instance wasn't accessible). `data/generate_synthetic_data.py`
-produces a deterministic (seeded) synthetic dataset instead: 250 patients,
-350 hospital visits, 600 prescriptions, plus supporting reference data
-(hospitals, doctors, medications, procedures, insurance providers,
-geography). Referential integrity is enforced at generation time — every
-prescription references a real patient/doctor/medication, every visit falls
-within realistic date ranges, etc.
+No production/real dataset was available for this project (real PHI
+can't be used for a portfolio project — see the HIPAA note in the
+original plan). `data/generate_synthetic_data.py` produces a
+deterministic (seeded) synthetic dataset: 250 patients, 350 hospital
+visits, 600 prescriptions, plus supporting reference data (hospitals,
+doctors, medications, procedures, insurance providers, geography).
 
-## Validated results
+## dbt transformation layer
 
-After a full run, row counts match exactly across all three layers with
-zero data loss:
+12 staging models (one per Bronze table) and 7 mart models (`dim_date`,
+`dim_patient`, `dim_doctor`, `dim_medication`, `dim_procedure`,
+`fact_prescription`, `fact_hospital_visit`), connected via `ref()`/
+`source()` so dbt builds the full dependency graph automatically —
+unchanged in shape from the Postgres version. What changed in this
+rework:
 
-| Table | raw | staging | analytics |
-|---|---|---|---|
-| patients | 250 | 250 | 250 (`patient_dim`) |
-| hospital_visits | 350 | 350 | 350 (`hospital_visit_fact`) |
-| prescriptions | 600 | 600 | 600 (`prescription_fact`) |
+- Schema config: `staging`/`analytics` → `silver`/`gold`; source schema `raw` → `bronze`
+- `DISTINCT ON (col) ... ORDER BY col` (Postgres-only) → `QUALIFY ROW_NUMBER() OVER (PARTITION BY col ORDER BY col) = 1` (ANSI-adjacent, works on Databricks) across all 11 staging models needing dedup
+- `to_char(date, 'YYYYMMDD')::integer` → `CAST(date_format(date, 'yyyyMMdd') AS INT)`
+- `extract(year from age(current_date, dob))` → `FLOOR(months_between(current_date(), dob) / 12)`
+- `generate_series(...)::date` (date dimension) → `EXPLODE(SEQUENCE(...))`
 
-`analytics.julian_date_dim` generates 7,305 rows (20 years of calendar
-dates, 2010–2029) independent of source data volume.
+60 tests still apply unchanged: `unique`/`not_null` on every primary
+key, `relationships` on every fact-table foreign key, `accepted_values`
+on categorical columns. See `dbt/README.md` for full setup and what
+each test checks.
+
+## Airflow orchestration
+
+`dags/healthcare_pipeline_dag.py` chains
+`generate_synthetic_data → upload_csvs_to_databricks →
+trigger_databricks_bronze_job → dbt_run → dbt_test`. The Bronze trigger
+calls the Databricks Jobs API directly (`run-now`) rather than a local
+`psql` command, since the warehouse is now a cloud workspace, not a
+container on the same docker-compose network. See `AIRFLOW_README.md`
+for full setup and the note on why the ADT stream runs outside this
+schedule entirely.
+
+## Kafka + Auto Loader streaming
+
+A producer simulates ADT events; a consumer lands them as batch files;
+Auto Loader ingests those into `workspace.silver.adt_events`. See
+`KAFKA_README.md` for the full design, including why this isn't a
+direct Kafka-to-Databricks connection (serverless network
+restrictions) and why it's still a plain `kafka-python` consumer rather
+than Spark Structured Streaming locally (JAR version-pinning risk,
+same reasoning as before).
+
+```bash
+./scripts/run_kafka_demo.sh
+```
 
 ## Sample queries
 
-See `sql/05_sample_queries.sql` for the full set (10 queries). A couple of
-examples:
+See `databricks/sql/gold_sample_queries.sql` for the full set (11
+queries — the original 10 analyses, ported to Databricks SQL and
+re-pointed at the actual dbt model names, plus a new bed-occupancy
+query against the ADT stream). Two examples:
 
 **Average length of stay by hospital**
 ```sql
@@ -213,263 +218,76 @@ SELECT
     hospital,
     COUNT(*)                      AS total_visits,
     ROUND(AVG(length_of_stay), 1) AS avg_length_of_stay_days
-FROM analytics.hospital_visit_fact
+FROM workspace.gold.fact_hospital_visit
 GROUP BY hospital
 ORDER BY avg_length_of_stay_days DESC;
 ```
 
-**Monthly admission trend, using the date dimension**
+**Current bed occupancy, from the ADT stream**
 ```sql
-SELECT
-    d.year_num, d.month_num, d.month_name,
-    COUNT(*) AS admissions
-FROM analytics.hospital_visit_fact hv
-JOIN analytics.julian_date_dim d ON hv.admission_date = d.julian_day
-GROUP BY d.year_num, d.month_num, d.month_name
-ORDER BY d.year_num, d.month_num;
+SELECT hospital_id, room_no, event_type, event_time,
+       ROW_NUMBER() OVER (PARTITION BY hospital_id, room_no ORDER BY event_time DESC) AS rn
+FROM workspace.silver.adt_events
+QUALIFY rn = 1 AND event_type != 'discharge';
 ```
 
-![Sample query output](docs/sample_query_output.png)
+## What's still open
 
-## dbt transformation layer
+Being upfront about what this rework did and didn't finish, rather than
+implying more is done than actually is:
 
-The `dbt/` folder reimplements the staging and analytics layers as a dbt
-project: 12 staging models (one per raw table) and 7 mart models (`dim_date`,
-`dim_patient`, `dim_doctor`, `dim_medication`, `dim_procedure`,
-`fact_prescription`, `fact_hospital_visit`), all connected via `ref()`/
-`source()` so dbt can build the full dependency graph automatically.
-
-**60/60 tests pass** — every primary key is checked `unique`/`not_null`,
-and every foreign key in a fact table is checked with a `relationships`
-test against its dimension. This is the automated version of the
-column-width bug documented below: with these tests in place, that bug
-would have failed loudly and specifically instead of silently producing
-empty downstream tables.
-
-`dbt docs generate && dbt docs serve` renders an interactive, searchable
-lineage graph for the whole project. Example — `fact_hospital_visit` traced
-back through its four staging models to their raw sources:
-
-![dbt lineage graph](docs/dbt_lineage_graph.png)
-
-See `dbt/README.md` for full setup and details on what each test checks.
-
-## Airflow orchestration
-
-The `dags/healthcare_pipeline_dag.py` DAG chains the whole pipeline into
-one scheduled, monitored run: `generate_synthetic_data → load_raw_data →
-dbt_run → dbt_test → validate_migration`. Runs in Airflow's `standalone`
-mode (single container, SQLite metadata DB) via a custom image
-(`Dockerfile.airflow`) with `psql`, `dbt-core`, and `dbt-postgres` baked
-in on top of the official Airflow image.
-
-```bash
-docker compose up -d --build   # first run builds the custom image, takes a few minutes
-```
-
-Web UI at `http://localhost:8083` (admin credentials are auto-generated
-and printed in `docker logs healthcare_airflow` on first boot).
-
-Every task passed end to end on a full run: `dbt_run` built all 19 models,
-`dbt_test` passed all 60 tests, `validate_migration` confirmed matching
-row counts across raw/staging/analytics — all orchestrated, not run by
-hand. See `AIRFLOW_README.md` for full setup and a note on why this uses
-`standalone`/`SequentialExecutor` rather than a full `CeleryExecutor`
-production setup.
-
-## MinIO / S3-pattern ingestion
-
-Adds an object-storage hop before data reaches `raw.*`: CSVs land in
-[MinIO](https://min.io/) (an S3-compatible object store, running
-locally in Docker) before being loaded into Postgres — mirroring how a
-real cloud pipeline stages files in S3 before `COPY INTO`-ing them into
-a warehouse. Written against the standard `boto3` S3 client, so the same
-code works against real AWS S3 with just a different endpoint and
-credentials.
-
-Real AWS wasn't used here deliberately — AWS now requires a card at
-signup even for free-tier usage, not worth the risk for a local demo
-project. MinIO gets the actual ingestion pattern right without that
-risk; the honest gap is this skips the IAM/console side of real AWS,
-since there's no AWS account involved.
-
-```bash
-./scripts/run_all_via_s3.sh
-```
-
-Browse what actually landed in object storage at `http://localhost:9001`
-(login: `minioadmin`/`minioadmin`) — a real bucket with all 12 CSVs under
-a `raw/` prefix, same as they'd sit in production S3. See
-`MINIO_README.md` for full details.
-
-## PySpark distributed processing
-
-A PySpark job reads raw CSVs directly out of MinIO, joins/aggregates
-them with DataFrames, writes a partitioned Parquet dataset back to
-object storage, and loads a summary table into Postgres via JDBC —
-the "large dataset → Spark → warehouse" pattern.
-
-Local PySpark rather than Databricks, deliberately: Databricks now has
-a genuine free tier, but it's a separate hosted workspace disconnected
-from this repo, breaking the "one `docker compose up` gets you
-everything" story. Local PySpark uses the identical DataFrame API and
-concepts while staying fully integrated and reproducible.
-
-```bash
-./scripts/run_spark_job.sh
-```
-
-Verify with `SELECT * FROM spark_analytics.monthly_hospital_summary` in
-Postgres, or browse the partitioned Parquet output at
-`healthcare-raw-files/processed/hospital_visits_enriched/` in MinIO's
-console (`localhost:9001`) — partitioned by `admission_year`/
-`admission_month`, the standard data-lake layout. See `SPARK_README.md`
-for full details.
-
-## Kafka streaming
-
-A producer simulates real-time patient events (admissions, lab results,
-vital signs) and publishes them to a Kafka topic; a consumer reads them
-into `streaming.patient_events` in Postgres — the "Patient Event → Kafka
-→ Warehouse" pattern.
-
-The roadmap calls for Kafka → **Spark Streaming** → warehouse. That's
-swapped here for a plain `kafka-python` consumer instead — Spark's
-Kafka connector needs its own separately version-pinned JAR chain on
-top of the Hadoop-AWS/JDBC jars already fought through for the Spark
-layer, and a plain consumer demonstrates the same core Kafka mechanics
-(topics, partitions, consumer groups, offset commits) without that
-specific fragility. See `KAFKA_README.md` for the full reasoning.
-
-```bash
-./scripts/run_kafka_demo.sh
-```
-
-Publishes ~150 simulated events with randomized delays (imitating
-real-time arrival), then consumes them into Postgres. Verify with
-`SELECT event_type, COUNT(*) FROM streaming.patient_events GROUP BY
-event_type`, or browse the topic itself in Kafka UI at
-`http://localhost:8084`.
+- **ICD-10-style malformed-code validation and missing-insurance-link
+  flagging**, described in the original plan as new work for this
+  version, haven't been added to `generate_synthetic_data.py` or the
+  staging models yet.
+- **Delta `MERGE`-based incremental dimension updates.** Current
+  staging models are `view`/`table` full-refresh materializations.
+  dbt-databricks supports `incremental` materialization with a `merge`
+  strategy natively — worth implementing for at least `stg_patients`
+  as a concrete before-an-interview example.
+- **`docs/architecture_diagram.svg`** predates this rework and shows the
+  old Postgres/MinIO/local-Spark architecture — needs regenerating.
 
 ## Challenges encountered (and how they were resolved)
 
-Documenting these because working through them was most of the actual
-engineering effort. Trimmed to the ones that generalize into an actual
-lesson, not just "and then it worked":
-
-- **Port 5432 conflict.** Two pre-existing native Windows PostgreSQL
-  services (versions 17 and 18) were already bound to port 5432, silently
-  intercepting every connection attempt from the host machine, while
-  container-to-container tools (Adminer) worked fine because they never
-  touched the host network stack. Diagnosed with `netstat -ano | findstr
-  5432`, confirmed via `Get-Service *postgres*`, resolved by stopping both
-  native services and setting them to manual startup.
-- **Cascading FK failures from a column-width bug.** `staging.hospitals`,
-  `staging.doctors`, and `staging.insurance_providers` all failed to load
-  with `value too long for type character varying(20)` — synthetic phone
-  numbers with extensions exceeded the column width. Because
-  `staging.prescriptions` and `staging.hospital_visits` have foreign keys
-  into `doctors`, their inserts failed too, even though the actual error was
-  three tables upstream. Root-caused via the Postgres error output rather
-  than assuming the immediately-failing table was the actual problem;
-  fixed by widening the affected columns.
-- **Silent partial script execution.** A GUI SQL editor was running only
-  the selected/highlighted statement rather than the full pasted script,
-  producing tables that *looked* successfully created but were missing
-  their transform data — row counts of 0 with no error shown. Caught by
-  cross-checking row counts against `information_schema.tables` rather
-  than trusting "no error" as confirmation of success; resolved by running
-  full scripts via `psql -f` instead, which doesn't have this ambiguity.
-- **Git Bash silently mangling container paths — twice, two different
-  ways.** First occurrence: `upload_to_s3.sh` passed
-  `/opt/airflow/data/upload_to_object_storage.py` as a bare argument to
-  `docker exec`. Git Bash's MSYS2 layer auto-translates arguments that
-  look like POSIX absolute paths into Windows paths before the command
-  ever runs — the container received `C:/Program Files/Git/opt/airflow/...`,
-  a path that only exists on the Windows host. Fixed (at the time) by
-  wrapping the command in `bash -c "python3 /opt/..."`, since MSYS2's
-  heuristic didn't fire — but that fix turned out to be incidental, not
-  principled: it worked only because the string happened to *start* with
-  `python3`, not `/`. The real trigger is "does this argument start with
-  a leading slash," not "is this a whole command string." Second
-  occurrence, same bug, different command: `run_spark_job.sh` used
-  `docker compose run --rm spark sh -c "/opt/spark/bin/spark-submit..."`
-  — this time the quoted string itself started with `/`, so it got
-  translated anyway, `bash -c` wrapping notwithstanding. Properly fixed
-  with `MSYS_NO_PATHCONV=1` prefixed to the command, which disables the
-  translation mechanism outright rather than trying to out-format-trick
-  it. Lesson: fixing the symptom in one script instead of understanding
-  the actual trigger condition meant the same bug resurfaced in a
-  sibling script untouched by the first fix.
-- **JAR/image version guessing, resolved by checking rather than
-  assuming.** `Dockerfile.spark` initially referenced
-  `apache/spark-py:v3.5.0`, which doesn't exist — that repo's tags are
-  sparse and irregularly published, and `v3.5.0` was never one of them.
-  Confirmed the actual available tags before picking `v3.4.0` instead of
-  guessing again. Once the image itself resolved, `spark-submit` still
-  wasn't found as a bare command — this image's entrypoint is built for
-  Kubernetes pass-through and doesn't put `spark-submit` on `PATH`;
-  needed the full `/opt/spark/bin/spark-submit`. The Hadoop-AWS/AWS-SDK
-  JAR versions pinned for S3 connectivity happened to align with this
-  image's bundled Hadoop version on the first real try — not guaranteed,
-  and `SPARK_README.md` documents the fallback (`spark-submit --version`)
-  for when they don't.
-
-## Roadmap
-
-This is Step 1 of a larger platform build:
-
-1. ✅ **Cloud/local warehouse migration** (this repo)
-2. ✅ **dbt transformation layer** (staging/analytics as dbt models, 60 tests, docs, lineage)
-3. ✅ **Airflow orchestration** (scheduled, monitored, retryable end-to-end DAG)
-4. ✅ **Docker containerization** (`scripts/` runs the entire pipeline via `docker exec` —
-   no psql, Python, or dbt required on the host machine, just Docker Desktop)
-5. ✅ **S3-pattern ingestion** (MinIO, S3-compatible, in place of real AWS S3 —
-   see the section above for why; the actual `boto3` code is portable to real AWS)
-6. ✅ **Spark distributed processing** (local PySpark rather than Databricks —
-   same DataFrame API/concepts, stays integrated and reproducible)
-7. ✅ **Kafka streaming** (plain `kafka-python` consumer rather than Spark
-   Structured Streaming — same core Kafka mechanics, see the section above for why)
+Carried over from the Postgres version — these generalize into actual
+lessons and remain accurate regardless of warehouse target (port
+conflicts, a column-width bug cascading into FK failures across
+staging tables, a GUI SQL editor silently running only the highlighted
+statement, Git Bash mangling container paths, and JAR/image version
+guessing on the now-removed local Spark layer). Full writeups
+preserved in git history from the pre-rework version of this README —
+worth re-reading before an interview even though the Spark-specific one
+no longer applies to the current architecture.
 
 ## Repo structure
 
 ```
-├── docker-compose.yml
-├── Dockerfile.airflow
+├── docker-compose.yml          # airflow + kafka/kafka-init/kafka-ui only
+├── Dockerfile.airflow          # dbt-databricks, databricks provider, databricks-cli
 ├── AIRFLOW_README.md
-├── MINIO_README.md
-├── SPARK_README.md
 ├── KAFKA_README.md
-├── Dockerfile.spark
-├── spark_jobs/
-│   └── spark_pipeline.py
-├── scripts/                  # zero-host-dependency pipeline runners (docker exec wrappers)
-│   ├── run_all.sh
-│   ├── run_all_via_s3.sh     # same pipeline, routed through MinIO
-│   ├── run_all_with_spark.sh # S3 path + Spark job on top
-│   ├── run_spark_job.sh
+├── RESUME_TALKING_POINTS.md
+├── scripts/                    # zero-host-dependency pipeline runners
+│   ├── generate_data.sh
 │   ├── run_kafka_producer.sh
 │   ├── run_kafka_consumer.sh
-│   ├── run_kafka_demo.sh     # producer + consumer in sequence
-│   ├── setup_db.sh
-│   ├── generate_data.sh
-│   ├── load_data.sh
-│   ├── upload_to_s3.sh
-│   ├── load_from_s3.sh
-│   ├── run_transforms.sh
-│   ├── run_dbt.sh
-│   └── validate.sh
+│   ├── run_kafka_demo.sh
+│   ├── upload_adt_batch_to_databricks.sh
+│   └── run_dbt.sh
 ├── dags/
 │   └── healthcare_pipeline_dag.py
-├── airflow_profiles/
-│   └── profiles.yml         # dbt profile used inside the Airflow container
-├── sql/
-│   ├── 00_setup_schemas.sql
-│   ├── 01_raw_tables.sql
-│   ├── 02_staging_tables.sql
-│   ├── 03_analytics_tables.sql
-│   ├── 04_validate_migration.sql
-│   └── 05_sample_queries.sql
+├── data/
+│   ├── generate_synthetic_data.py
+│   ├── kafka_producer.py
+│   └── kafka_consumer.py       # writes adt_landing/*.jsonl, gitignored
+├── databricks/
+│   ├── README.md
+│   ├── notebooks/
+│   │   ├── 01_bronze_ingest.py
+│   │   └── 02_adt_autoloader.py
+│   └── sql/
+│       └── gold_sample_queries.sql
 ├── dbt/
 │   ├── README.md
 │   ├── profiles.yml.sample
@@ -477,17 +295,10 @@ This is Step 1 of a larger platform build:
 │       ├── dbt_project.yml
 │       ├── macros/
 │       └── models/
-│           ├── staging/    # 12 stg_ models + sources.yml + tests
-│           └── marts/      # 7 dim_/fact_ models + tests
-├── data/
-│   ├── generate_synthetic_data.py
-│   ├── upload_to_object_storage.py
-│   ├── load_from_object_storage.py
-│   ├── kafka_producer.py
-│   └── kafka_consumer.py
-├── load_synthetic_data.sql
-├── snowflake/              # original Snowflake-dialect DDL
+│           ├── staging/        # 12 stg_ models + sources.yml + tests -> silver
+│           └── marts/          # 7 dim_/fact_ models + tests -> gold
 └── docs/
-    ├── erd/                # source ER diagrams
+    ├── erd/                    # source ER diagrams
+    ├── architecture_diagram.svg  # stale, needs regenerating
     └── dbt_lineage_graph.png
 ```

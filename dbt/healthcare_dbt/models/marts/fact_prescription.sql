@@ -3,7 +3,7 @@ select
     rx.patient_id,
     rx.doctor_id,
     rx.medication_id,
-    to_char(rx.prescribed_date, 'YYYYMMDD')::integer as prescribed_date,
+    cast(date_format(rx.prescribed_date, 'yyyyMMdd') as int) as prescribed_date,
     rx.quantity,
     rx.dosage,
     rx.frequency,

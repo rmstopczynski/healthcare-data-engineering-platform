@@ -1,8 +1,11 @@
 -- =====================================================================
--- SAMPLE ANALYTICS QUERIES
--- Business questions answered directly from the analytics.* star schema.
--- Good candidates to screenshot/paste into a GitHub README to show the
--- pipeline actually produces useful output, not just moved data around.
+-- SAMPLE ANALYTICS QUERIES (Gold layer, Databricks)
+-- Ported from the original Postgres analytics.* raw-SQL path onto the
+-- dbt-built Gold models (workspace.gold.fact_*/dim_*). Table/column
+-- names below match the actual dbt models, not the older sql/05
+-- version's naming -- that raw-SQL path was a redundant duplicate of
+-- the dbt marts and has been removed; these are the same 10 business
+-- questions, now run against the one real Gold layer.
 -- =====================================================================
 
 -- ---------------------------------------------------------------------
@@ -12,7 +15,7 @@ SELECT
     hospital,
     COUNT(*)                           AS total_visits,
     ROUND(AVG(length_of_stay), 1)      AS avg_length_of_stay_days
-FROM analytics.hospital_visit_fact
+FROM workspace.gold.fact_hospital_visit
 GROUP BY hospital
 ORDER BY avg_length_of_stay_days DESC;
 
@@ -25,7 +28,7 @@ SELECT
     COUNT(*)                           AS total_visits,
     SUM(billing_amount)                AS total_billed,
     ROUND(AVG(billing_amount), 2)      AS avg_billed_per_visit
-FROM analytics.hospital_visit_fact
+FROM workspace.gold.fact_hospital_visit
 GROUP BY insurance_provider
 ORDER BY total_billed DESC;
 
@@ -38,8 +41,8 @@ SELECT
     m.category,
     COUNT(*)                           AS times_prescribed,
     SUM(pf.total_cost)                 AS total_revenue
-FROM analytics.prescription_fact pf
-JOIN analytics.medication_dim m ON pf.medication_id = m.medication_id
+FROM workspace.gold.fact_prescription pf
+JOIN workspace.gold.dim_medication m ON pf.medication_id = m.medication_id
 GROUP BY m.medication_name, m.category
 ORDER BY times_prescribed DESC
 LIMIT 10;
@@ -52,22 +55,22 @@ SELECT
     p.age_group,
     hv.diagnosis,
     COUNT(*)                           AS visit_count
-FROM analytics.hospital_visit_fact hv
-JOIN analytics.patient_dim p ON hv.patient_id = p.patient_id
+FROM workspace.gold.fact_hospital_visit hv
+JOIN workspace.gold.dim_patient p ON hv.patient_id = p.patient_id
 GROUP BY p.age_group, hv.diagnosis
 ORDER BY p.age_group, visit_count DESC;
 
 
 -- ---------------------------------------------------------------------
--- 5. Monthly admission trend (uses the date dimension)
+-- 5. Monthly admission trend (uses the Julian date dimension)
 -- ---------------------------------------------------------------------
 SELECT
     d.year_num,
     d.month_num,
     d.month_name,
     COUNT(*)                           AS admissions
-FROM analytics.hospital_visit_fact hv
-JOIN analytics.julian_date_dim d ON hv.admission_date = d.julian_day
+FROM workspace.gold.fact_hospital_visit hv
+JOIN workspace.gold.dim_date d ON hv.admission_date = d.julian_day
 GROUP BY d.year_num, d.month_num, d.month_name
 ORDER BY d.year_num, d.month_num;
 
@@ -81,8 +84,8 @@ SELECT
     doc.hospital_affi                        AS hospital,
     COUNT(DISTINCT hv.patient_id)             AS unique_patients_seen,
     COUNT(*)                                   AS total_visits
-FROM analytics.hospital_visit_fact hv
-JOIN analytics.doctor_dim doc ON hv.doctor_id = doc.doctor_id
+FROM workspace.gold.fact_hospital_visit hv
+JOIN workspace.gold.dim_doctor doc ON hv.doctor_id = doc.doctor_id
 GROUP BY doc.doctor_id, doc.first_name, doc.last_name, doc.specialty, doc.hospital_affi
 ORDER BY total_visits DESC
 LIMIT 10;
@@ -96,8 +99,8 @@ SELECT
     p.first_name || ' ' || p.last_name  AS patient_name,
     COUNT(*)                             AS visit_count,
     SUM(hv.billing_amount)                AS total_billed
-FROM analytics.hospital_visit_fact hv
-JOIN analytics.patient_dim p ON hv.patient_id = p.patient_id
+FROM workspace.gold.fact_hospital_visit hv
+JOIN workspace.gold.dim_patient p ON hv.patient_id = p.patient_id
 GROUP BY p.patient_id, p.first_name, p.last_name
 HAVING COUNT(*) > 1
 ORDER BY visit_count DESC;
@@ -111,8 +114,8 @@ SELECT
     COUNT(*)                            AS procedure_count,
     SUM(hv.procedure_charge)             AS total_revenue,
     ROUND(AVG(hv.procedure_charge), 2)    AS avg_charge
-FROM analytics.hospital_visit_fact hv
-JOIN analytics.procedure_dim proc ON hv.procedure_id = proc.procedure_id
+FROM workspace.gold.fact_hospital_visit hv
+JOIN workspace.gold.dim_procedure proc ON hv.procedure_id = proc.procedure_id
 GROUP BY proc.medical_category
 ORDER BY total_revenue DESC;
 
@@ -126,8 +129,8 @@ SELECT
     SUM(CASE WHEN pf.refill_allowed THEN 1 ELSE 0 END)                 AS refillable_count,
     ROUND(100.0 * SUM(CASE WHEN pf.refill_allowed THEN 1 ELSE 0 END)
           / COUNT(*), 1)                                                AS refillable_pct
-FROM analytics.prescription_fact pf
-JOIN analytics.medication_dim m ON pf.medication_id = m.medication_id
+FROM workspace.gold.fact_prescription pf
+JOIN workspace.gold.dim_medication m ON pf.medication_id = m.medication_id
 GROUP BY m.category
 ORDER BY refillable_pct DESC;
 
@@ -140,7 +143,21 @@ SELECT
     d.quarter,
     COUNT(*)                            AS visits,
     SUM(hv.billing_amount)               AS total_billed
-FROM analytics.hospital_visit_fact hv
-JOIN analytics.julian_date_dim d ON hv.admission_date = d.julian_day
+FROM workspace.gold.fact_hospital_visit hv
+JOIN workspace.gold.dim_date d ON hv.admission_date = d.julian_day
 GROUP BY d.year_num, d.quarter
 ORDER BY d.year_num, d.quarter;
+
+
+-- ---------------------------------------------------------------------
+-- 11. Current bed occupancy from the ADT stream (new in this version --
+--     the whole point of the streaming branch existing at all)
+-- ---------------------------------------------------------------------
+SELECT
+    hospital_id,
+    room_no,
+    event_type,
+    event_time,
+    ROW_NUMBER() OVER (PARTITION BY hospital_id, room_no ORDER BY event_time DESC) AS rn
+FROM workspace.silver.adt_events
+QUALIFY rn = 1 AND event_type != 'discharge';

@@ -1,8 +1,8 @@
 version: 2
 
 sources:
-  - name: raw
-    schema: raw
+  - name: bronze
+    schema: bronze
     description: >
       Untouched landing tables, loaded directly from CSV exports.
       Mirrors the original normalized (3NF) source schema 1:1.

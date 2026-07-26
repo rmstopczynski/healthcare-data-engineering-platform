@@ -1,4 +1,4 @@
-select distinct on (prescription_id)
+select
     prescription_id,
     patient_id,
     doctor_id,
@@ -9,5 +9,5 @@ select distinct on (prescription_id)
     prescribed_date,
     refill_allowed,
     refill_count
-from {{ source('raw', 'prescriptions') }}
-order by prescription_id
+from {{ source('bronze', 'prescriptions') }}
+qualify row_number() over (partition by prescription_id order by prescription_id) = 1

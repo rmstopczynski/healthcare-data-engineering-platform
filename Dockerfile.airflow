@@ -1,22 +1,17 @@
 # Extends the official Airflow image with everything our DAG and
-# scripts need: psql, dbt, faker (synthetic data), boto3 (S3/MinIO),
-# psycopg2 (direct Postgres access), and kafka-python (pure-Python
-# Kafka client -- deliberately not confluent-kafka, which needs
-# librdkafka compiled and is another version-alignment risk we don't
-# need here).
+# scripts need: dbt (targeting Databricks), faker (synthetic data),
+# the Databricks provider (Jobs API calls from the DAG), the Databricks
+# CLI (uploading CSVs/ADT batches to the workspace volume), and
+# kafka-python (pure-Python Kafka client -- deliberately not
+# confluent-kafka, which needs librdkafka compiled and is another
+# version-alignment risk we don't need here).
 FROM apache/airflow:2.9.3
-
-USER root
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends postgresql-client \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
 
 USER airflow
 RUN pip install --no-cache-dir \
     dbt-core==1.8.* \
-    dbt-postgres==1.8.* \
+    dbt-databricks==1.8.* \
+    apache-airflow-providers-databricks \
+    databricks-cli \
     faker \
-    boto3 \
-    psycopg2-binary \
     kafka-python
